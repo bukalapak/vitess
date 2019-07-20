@@ -4,6 +4,12 @@ FROM vitess/bootstrap:percona57
 USER root
 COPY . /vt/src/vitess.io/vitess
 
+# Download vendored Go dependencies
+RUN cd /vt/src/vitess.io/vitess && \
+    go get -u github.com/kardianos/govendor && \
+    govendor sync && \
+    rm -rf /vt/.cache
+
 # Build Vitess
 RUN make build
 
