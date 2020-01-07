@@ -1697,6 +1697,146 @@ func TestSerializeTransactionsSameRow_ExecuteBatchAsTransaction(t *testing.T) {
 	}
 }
 
+// Same as above, but for the case where we do SELECT ... FOR UPDATE followed
+// by UPDATE, which is a common pattern when using an ORM.
+func TestSerializeTransactionsSameRow_ExecuteBatchAsTransaction_WithSelectLock(t *testing.T) {
+	// This test runs three transaction in parallel:
+	// tx1 | tx2 | tx3
+	// However, tx1 and tx2 have the same WHERE clause (i.e. target the same row)
+	// and therefore tx2 cannot start until the first query of tx1 has finished.
+	// The actual execution looks like this:
+	// tx1 | tx3
+	// tx2
+	db := setUpTabletServerTest(t)
+	defer db.Close()
+	testUtils := newTestUtils()
+	config := testUtils.newQueryServiceConfig()
+	config.EnableHotRowProtection = true
+	config.HotRowProtectionConcurrentTransactions = 1
+	// Reduce the txpool to 2 because we should never consume more than two slots.
+	config.TransactionCap = 2
+	tsv := NewTabletServerWithNilTopoServer(config)
+	dbcfgs := testUtils.newDBConfigs(db)
+	target := querypb.Target{TabletType: topodatapb.TabletType_MASTER}
+	if err := tsv.StartService(target, dbcfgs); err != nil {
+		t.Fatalf("StartService failed: %v", err)
+	}
+	defer tsv.StopService()
+	countStart := tabletenv.WaitStats.Counts()["TxSerializer"]
+
+	// Fake data.
+	s1 := "select * from test_table where pk = :pk limit 1 for update /* tx1 */"
+	s2 := "select * from test_table where pk = :pk limit 1 for update /* tx2 */"
+	s3 := "select * from test_table where pk = :pk limit 1 for update /* tx3 */"
+	u1 := "update test_table set name_string = 'tx1' where pk = :pk"
+	u2 := "update test_table set name_string = 'tx2' where pk = :pk"
+	u3 := "update test_table set name_string = 'tx3' where pk = :pk"
+	// Every request needs their own bind variables to avoid data races.
+	bvTx1 := map[string]*querypb.BindVariable{
+		"pk": sqltypes.Int64BindVariable(1),
+	}
+	bvTx2 := map[string]*querypb.BindVariable{
+		"pk": sqltypes.Int64BindVariable(1),
+	}
+	bvTx3 := map[string]*querypb.BindVariable{
+		"pk": sqltypes.Int64BindVariable(2),
+	}
+
+	// Make sure that tx2 and tx3 start only after tx1 is running its Execute().
+	tx1Started := make(chan struct{})
+
+	db.SetBeforeFunc("select * from test_table where pk = 1 limit 1 for update /* tx1 */",
+		func() {
+			close(tx1Started)
+			if err := waitForTxSerializationPendingQueries(tsv, "test_table where pk = 1", 2); err != nil {
+				t.Fatal(err)
+			}
+		})
+
+	// Run all three transactions.
+	ctx := context.Background()
+	wg := sync.WaitGroup{}
+
+	// tx1.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		results, err := tsv.ExecuteBatch(ctx, &target, []*querypb.BoundQuery{
+			{
+				Sql:           s1,
+				BindVariables: bvTx1,
+			},
+			{
+				Sql:           u1,
+				BindVariables: bvTx1,
+			},
+		}, true /*asTransaction*/, 0 /*transactionID*/, nil /*options*/)
+		if err != nil {
+			t.Errorf("failed to execute query: %s: %s", s1, err)
+		}
+		if len(results) != 2 || results[0].RowsAffected != 1 || results[1].RowsAffected != 1 {
+			t.Errorf("TabletServer.ExecuteBatch returned wrong results: %+v", results)
+		}
+	}()
+
+	// tx2.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		<-tx1Started
+		results, err := tsv.ExecuteBatch(ctx, &target, []*querypb.BoundQuery{
+			{
+				Sql:           s2,
+				BindVariables: bvTx2,
+			},
+			{
+				Sql:           u2,
+				BindVariables: bvTx2,
+			},
+		}, true /*asTransaction*/, 0 /*transactionID*/, nil /*options*/)
+		if err != nil {
+			t.Errorf("failed to execute query: %s: %s", s2, err)
+		}
+		if len(results) != 2 || results[0].RowsAffected != 1 || results[1].RowsAffected != 1 {
+			t.Errorf("TabletServer.ExecuteBatch returned wrong results: %+v", results)
+		}
+	}()
+
+	// tx3.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		<-tx1Started
+		results, err := tsv.ExecuteBatch(ctx, &target, []*querypb.BoundQuery{
+			{
+				Sql:           s3,
+				BindVariables: bvTx3,
+			},
+			{
+				Sql:           u3,
+				BindVariables: bvTx3,
+			},
+		}, true /*asTransaction*/, 0 /*transactionID*/, nil /*options*/)
+		if err != nil {
+			t.Errorf("failed to execute query: %s: %s", s3, err)
+		}
+		if len(results) != 2 || results[0].RowsAffected != 1 || results[1].RowsAffected != 1 {
+			t.Errorf("TabletServer.ExecuteBatch returned wrong results: %+v", results)
+		}
+	}()
+
+	wg.Wait()
+
+	got, ok := tabletenv.WaitStats.Counts()["TxSerializer"]
+	want := countStart + 1
+	if !ok || got != want {
+		t.Fatalf("only tx2 should have been serialized: ok? %v got: %v want: %v", ok, got, want)
+	}
+}
+
 func TestSerializeTransactionsSameRow_ConcurrentTransactions(t *testing.T) {
 	// This test runs three transaction in parallel:
 	// tx1 | tx2 | tx3
@@ -2915,6 +3055,46 @@ func getSupportedQueries() map[string]*sqltypes.Result {
 			RowsAffected: 1,
 			Rows: [][]sqltypes.Value{{
 				sqltypes.NewVarBinary("2"),
+			}},
+		},
+		// Queries for hot row protection test with SELECT ... FOR UPDATE followed by UPDATE.
+		"select * from test_table where pk = 1 limit 1 for update /* tx1 */": {
+			Fields: []*querypb.Field{
+				{Type: sqltypes.Int64},
+				{Type: sqltypes.Int64},
+				{Type: sqltypes.VarChar},
+			},
+			RowsAffected: 1,
+			Rows: [][]sqltypes.Value{{
+				sqltypes.NewVarBinary("1"),
+				sqltypes.NewVarBinary("1"),
+				sqltypes.NewVarBinary("abc"),
+			}},
+		},
+		"select * from test_table where pk = 1 limit 1 for update /* tx2 */": {
+			Fields: []*querypb.Field{
+				{Type: sqltypes.Int64},
+				{Type: sqltypes.Int64},
+				{Type: sqltypes.VarChar},
+			},
+			RowsAffected: 1,
+			Rows: [][]sqltypes.Value{{
+				sqltypes.NewVarBinary("1"),
+				sqltypes.NewVarBinary("1"),
+				sqltypes.NewVarBinary("abc"),
+			}},
+		},
+		"select * from test_table where pk = 2 limit 1 for update /* tx3 */": {
+			Fields: []*querypb.Field{
+				{Type: sqltypes.Int64},
+				{Type: sqltypes.Int64},
+				{Type: sqltypes.VarChar},
+			},
+			RowsAffected: 1,
+			Rows: [][]sqltypes.Value{{
+				sqltypes.NewVarBinary("2"),
+				sqltypes.NewVarBinary("2"),
+				sqltypes.NewVarBinary("xyz"),
 			}},
 		},
 		// queries for twopc

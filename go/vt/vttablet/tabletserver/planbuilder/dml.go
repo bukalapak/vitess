@@ -191,6 +191,10 @@ func analyzeSelect(sel *sqlparser.Select, tables map[string]*schema.Table) (plan
 	}
 	if sel.Lock != "" {
 		plan.PlanID = PlanSelectLock
+		// Store the WHERE clause as string for the hot row protection (txserializer).
+		buf := sqlparser.NewTrackedBuffer(nil)
+		buf.Myprintf("%v", sel.Where)
+		plan.WhereClause = buf.ParsedQuery()
 	}
 
 	tableName := analyzeFrom(sel.From)
